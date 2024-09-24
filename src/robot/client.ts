@@ -1,13 +1,9 @@
 /* eslint-disable max-classes-per-file */
 import { grpc } from '@improbable-eng/grpc-web';
-import {
-  dialDirect,
-  dialWebRTC,
-  type Credentials,
-  type DialOptions,
-} from '@viamrobotics/rpc';
+import { dialDirect, dialWebRTC, type DialOptions } from '@viamrobotics/rpc';
 import { backOff } from 'exponential-backoff';
 import { Duration } from 'google-protobuf/google/protobuf/duration_pb';
+import { isCredential, type Credentials } from '../app/viam-transport';
 import { DIAL_TIMEOUT } from '../constants';
 import { EventDispatcher, MachineConnectionEvent } from '../events';
 import type {
@@ -36,7 +32,7 @@ import { SensorsServiceClient } from '../gen/service/sensors/v1/sensors_pb_servi
 import { SLAMServiceClient } from '../gen/service/slam/v1/slam_pb_service';
 import { VisionServiceClient } from '../gen/service/vision/v1/vision_pb_service';
 import { ViamResponseStream } from '../responses';
-import { encodeResourceName, promisify, MetadataTransport } from '../utils';
+import { MetadataTransport, encodeResourceName, promisify } from '../utils';
 import GRPCConnectionManager from './grpc-connection-manager';
 import type { Robot, RobotStatusStream } from './robot';
 import SessionManager from './session-manager';
@@ -102,6 +98,8 @@ export class RobotClient extends EventDispatcher implements Robot {
   private savedAuthEntity: string | undefined;
 
   private savedCreds: Credentials | undefined;
+
+  private closed: boolean;
 
   private robotServiceClient: RobotServiceClient | undefined;
 
@@ -186,12 +184,18 @@ export class RobotClient extends EventDispatcher implements Robot {
         this.emit('connectionstatechange', { eventType });
       });
     }
+
+    this.closed = false;
   }
 
   private onDisconnect(event?: Event) {
     this.emit(MachineConnectionEvent.DISCONNECTED, event ?? {});
 
     if (this.noReconnect) {
+      return;
+    }
+
+    if (this.closed) {
       return;
     }
 
@@ -399,6 +403,7 @@ export class RobotClient extends EventDispatcher implements Robot {
       this.peerConn = undefined;
     }
     this.sessionManager.reset();
+    this.closed = true;
     this.emit(MachineConnectionEvent.DISCONNECTED, {});
   }
 
@@ -415,6 +420,7 @@ export class RobotClient extends EventDispatcher implements Robot {
     dialTimeout,
   }: ConnectOptions = {}) {
     this.emit(MachineConnectionEvent.CONNECTING, {});
+    this.closed = false;
 
     if (this.connecting) {
       // This lint is clearly wrong due to how the event loop works such that after an await, the condition may no longer be true.
@@ -443,13 +449,20 @@ export class RobotClient extends EventDispatcher implements Robot {
     try {
       const opts: DialOptions = {
         authEntity,
-        credentials: creds,
         webrtcOptions: {
           disableTrickleICE: false,
           rtcConfig: this.webrtcOptions?.rtcConfig,
         },
         dialTimeout: dialTimeout ?? DIAL_TIMEOUT,
       };
+
+      if (creds) {
+        if (isCredential(creds)) {
+          opts.credentials = creds;
+        } else {
+          opts.accessToken = creds.payload;
+        }
+      }
 
       // Webrtcoptions will always be defined, but TS doesn't know this
       if (priority !== undefined && opts.webrtcOptions) {
